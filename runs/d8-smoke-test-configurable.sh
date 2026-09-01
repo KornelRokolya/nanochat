@@ -3,6 +3,17 @@
 # Stop the script immediately if any command fails.
 set -e
 
+# Training configuration.
+DEPTH=8
+DEVICE_BATCH_SIZE=16
+TOTAL_BATCH_SIZE=524288
+NUM_ITERATIONS=100
+WINDOW_PATTERN="L"
+
+# Dataset configuration.
+TOKENIZER_SHARDS=8
+TRAINING_SHARDS=170
+
 
 # =============================================================================
 # CONFIGURATION
@@ -51,17 +62,6 @@ while true; do
   RUN_INDEX=$((RUN_INDEX + 1))
 done
 exec > >(tee "${OUTPUT_FILE}") 2>&1
-
-# Training configuration.
-DEPTH=8
-DEVICE_BATCH_SIZE=16
-TOTAL_BATCH_SIZE=524288
-NUM_ITERATIONS=20
-WINDOW_PATTERN="L"
-
-# Dataset configuration.
-TOKENIZER_SHARDS=8
-TRAINING_SHARDS=170
 
 
 # =============================================================================
@@ -161,8 +161,18 @@ echo "=== Download first ${TOKENIZER_SHARDS} shards ==="
 python -m nanochat.dataset -n "${TOKENIZER_SHARDS}"
 
 
-echo "=== Train tokenizer ==="
-python -m scripts.tok_train
+# Tokenizer training - skipped if tokenizer found
+TOKENIZER_DIR="${NANOCHAT_BASE_DIR}/tokenizer"
+
+if [ -d "${TOKENIZER_DIR}" ]; then
+  echo "=== Existing tokenizer found, skipping tokenizer training ==="
+else
+  echo "=== Download first ${TOKENIZER_SHARDS} shards ==="
+  python -m nanochat.dataset -n "${TOKENIZER_SHARDS}"
+
+  echo "=== Train tokenizer ==="
+  python -m scripts.tok_train
+fi
 
 
 echo "=== Evaluate tokenizer ==="
@@ -181,15 +191,15 @@ echo "=== Run ${EXPERIMENT_NAME} ==="
 
 # 2>&1 combines normal output and errors.
 # tee shows the output live while also saving it to OUTPUT_FILE.
-python -m scripts.base_train \
+python -m scripts.base_train2 \
   --depth="${DEPTH}" \
-  --device-batch-size = "${DEVICE_BATCH_SIZE}" \
-  --total-batch-size = "${TOTAL_BATCH_SIZE}" \
-  --num-iterations = "${NUM_ITERATIONS}" \
-  --window-pattern = "${WINDOW_PATTERN}" \
-  --run = "${RUN_NAME}" \
-  --lr-cycle-amplitude = 0.80 \
-  --lr-cycle-period = 100
+  --device-batch-size="${DEVICE_BATCH_SIZE}" \
+  --total-batch-size="${TOTAL_BATCH_SIZE}" \
+  --num-iterations="${NUM_ITERATIONS}" \
+  --window-pattern="${WINDOW_PATTERN}" \
+  --run="${RUN_NAME}" \
+  --lr-cycle-amplitude=0.00 \
+  --lr-cycle-period=40
 
 
 echo
