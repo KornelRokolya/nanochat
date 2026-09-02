@@ -7,7 +7,7 @@ set -e
 DEPTH=8
 DEVICE_BATCH_SIZE=16
 TOTAL_BATCH_SIZE=524288
-NUM_ITERATIONS=100
+NUM_ITERATIONS=20
 WINDOW_PATTERN="L"
 
 # Dataset configuration.
@@ -32,6 +32,9 @@ WORKSPACE="/workspace"
 
 # Local nanochat checkout.
 REPO_DIR="${WORKSPACE}/nanochat"
+
+# Directory for additional experiment outputs.
+OUTPUT_DIR="${WORKSPACE}"
 
 # Nanochat datasets/tokenizers/checkpoints/cache.
 NANOCHAT_BASE_DIR="${WORKSPACE}/nanochat_cache"
