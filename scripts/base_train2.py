@@ -125,6 +125,11 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
+# BOS-aware loss weighting.
+# The first predicted token after each BOS gets weight 0.2,
+# rising linearly to full weight 1.0 by the 16th token.
+bos_token_id = tokenizer.get_bos_token_id()
+
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
@@ -396,6 +401,42 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
+def apply_bos_loss_ramp(token_loss, x, y, start_weight=0.2, ramp_tokens=16):
+    """
+    Reduce loss weight for the first few predictions after every BOS token.
+
+    Weight ramps linearly:
+        token 1 after BOS -> start_weight
+        token ramp_tokens after BOS -> 1.0
+        later tokens -> 1.0
+    """
+
+    token_loss = token_loss.view_as(y)
+
+    positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+
+    # Position of BOS tokens; non-BOS positions get a large negative value.
+    bos_positions = torch.where(
+        x == bos_token_id,
+        positions,
+        torch.full_like(positions, -x.size(1)),
+    )
+
+    # Most recent BOS for every position in every batch row.
+    last_bos_position = bos_positions.cummax(dim=1).values
+
+    distance_from_bos = positions - last_bos_position
+
+    # 0.2 -> 1.0 over the first 16 predictions after BOS.
+    weights = start_weight + (1.0 - start_weight) * (
+        distance_from_bos.float() / (ramp_tokens - 1)
+    ).clamp(0.0, 1.0)
+
+    # Ignore padding/invalid targets.
+    valid = y != -1
+
+    return (token_loss * weights * valid).sum() / valid.sum()
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -519,7 +560,16 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        token_loss = model(x, y)
+
+        loss = apply_bos_loss_ramp(
+                token_loss,
+                x,
+                y,
+                start_weight=0.2,
+                ramp_tokens=16,
+            )
+
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
