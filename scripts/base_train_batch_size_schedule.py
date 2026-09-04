@@ -215,146 +215,487 @@ def SaveModelAsRawParams(model_to_save, output_directory):
     print0(f"Saved raw float32 parameters to: {output_directory}")
 
 
+@torch.no_grad()
 def _rand_relative_to(reference, gain, generator):
-    """Unit-Frobenius random tensor scaled to gain * ||reference||_F."""
+    """Random tensor with Frobenius norm = gain * ||reference||_F."""
     ref32 = reference.detach().float()
+
     rnd = torch.randn(
         ref32.shape,
         device=ref32.device,
         dtype=torch.float32,
         generator=generator,
     )
+
     rnd_norm = torch.linalg.vector_norm(rnd)
     ref_norm = torch.linalg.vector_norm(ref32)
-    # A zero source matrix still gets a small absolute perturbation scale.
-    target_norm = gain * (ref_norm if ref_norm > 0 else torch.tensor(1.0, device=ref32.device))
+
+    target_norm = gain * (
+        ref_norm
+        if ref_norm > 0
+        else torch.tensor(1.0, device=ref32.device)
+    )
+
     rnd = rnd / rnd_norm.clamp_min(1e-12) * target_norm
     return rnd
 
 
 @torch.no_grad()
-def _morph_rectangular_double(weight, gain, generator):
-    """For W:[m,n], create [2m,2n] using [[W-A,A],[B,W-B]].
+def _rand_like_shape(shape, device, target_norm, generator):
+    """Generate random float32 tensor of given shape with chosen Frobenius norm."""
+    rnd = torch.randn(
+        shape,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
 
-    For duplicated input [x,x], this maps exactly to [Wx,Wx].
-    This works for square matrices and for both rectangular MLP matrices.
+    rnd_norm = torch.linalg.vector_norm(rnd)
+
+    return rnd / rnd_norm.clamp_min(1e-12) * target_norm
+
+
+@torch.no_grad()
+def _morph_rectangular_double(
+    weight,
+    gain,
+    generator,
+    output_noise_gain=0.01,
+):
+    """For W:[m,n], create a [2m,2n] widened matrix.
+
+    Main symmetry-breaking construction:
+
+        [[0.5W + A, 0.5W - A],
+         [0.5W + B, 0.5W - B]]
+
+    Then add a much smaller unrestricted perturbation E, so the mapping is
+    intentionally no longer exactly function preserving.
+
+    For duplicated input [x,x], without E the result would be [Wx,Wx].
     """
+
     W = weight.detach().float()
+
     A = _rand_relative_to(W, gain, generator)
     B = _rand_relative_to(W, gain, generator)
-    top = torch.cat([W - A, A], dim=1)
-    bottom = torch.cat([B, W - B], dim=1)
-    return torch.cat([top, bottom], dim=0)
+
+    half_W = 0.5 * W
+
+    top = torch.cat([
+        half_W + A,
+        half_W - A,
+    ], dim=1)
+
+    bottom = torch.cat([
+        half_W + B,
+        half_W - B,
+    ], dim=1)
+
+    widened = torch.cat([top, bottom], dim=0)
+
+    # Small non-canceling perturbation.
+    E = _rand_relative_to(
+        widened,
+        output_noise_gain,
+        generator,
+    )
+
+    return widened + E
 
 
 @torch.no_grad()
-def _morph_qkv_double_heads(weight, gain, generator):
-    """Double input width and head count while preserving the old head function.
+def _morph_qkv_double_heads(
+    weight,
+    gain,
+    generator,
+    output_noise_gain=0.01,
+):
+    """Double Q/K/V width and head count.
 
-    The first output half contains the old heads with a canceling random split.
-    The second output half is another canceling/randomized copy. On duplicated
-    residual input [x,x], both halves initially evaluate to W x exactly.
+    Uses the structured widening construction plus a small unrestricted
+    perturbation so both old and new heads begin slightly displaced from the
+    original function.
     """
-    return _morph_rectangular_double(weight, gain, generator)
+
+    return _morph_rectangular_double(
+        weight,
+        gain,
+        generator,
+        output_noise_gain=output_noise_gain,
+    )
 
 
 @torch.no_grad()
-def morph_model_width_2x(old_model, new_model, gain=MORPH_RANDOM_GAIN):
-    """Function-preserving-ish 2x-width morph for the current nanochat GPT.
+def morph_model_width_2x(
+    old_model,
+    new_model,
+    gain=MORPH_RANDOM_GAIN,
+    output_noise_gain=0.01,
+):
+    """Widen nanochat model by 2x with deliberate small function perturbations.
 
-    Preserved exactly (up to floating point):
-      * token embedding -> duplicated residual stream
-      * MLP c_fc/c_proj via [[W-A,A],[B,W-B]]
-      * old attention heads
-      * attention contribution, duplicated to both residual halves
-      * lm_head via averaging [W/2, W/2]
-      * per-layer scalar parameters and smear/backout behavior
+    Strategy:
+      * token embedding: duplicate old embedding + small random perturbation
+      * Q/K/V: structured 2x widening + small non-canceling perturbation
+      * W_O: preserve old heads approximately, initialize new-head contribution
+             with a small random matrix instead of exact zero
+      * MLP c_fc/c_proj: structured widening + non-canceling perturbation
+      * lm_head: average the duplicated residual halves + small random perturbation
+      * value embeddings: copy old channels + random new channels, and slightly
+                          perturb old channels too
+      * value gates: copy old gate rows with small noise; initialize new rows
+                     near zero with small random values
+      * scalar parameters: copy + very small perturbation
 
-    New attention heads are computed but their columns in W_O are zero, so they
-    cannot affect the residual stream initially. New value-embedding channels
-    are small random values; their corresponding new heads are likewise blocked
-    by W_O at the morph instant.
+    This is intentionally NOT exactly function preserving.
     """
+
     old_cfg = old_model.config
     new_cfg = new_model.config
 
-    assert new_cfg.n_layer == old_cfg.n_layer, "This morph keeps depth fixed."
+    assert new_cfg.n_layer == old_cfg.n_layer, \
+        "This morph keeps depth fixed."
+
     assert new_cfg.n_embd == 2 * old_cfg.n_embd
     assert new_cfg.n_head == 2 * old_cfg.n_head
     assert new_cfg.n_kv_head == 2 * old_cfg.n_kv_head
-    assert new_cfg.n_embd // new_cfg.n_head == old_cfg.n_embd // old_cfg.n_head
+
+    assert (
+        new_cfg.n_embd // new_cfg.n_head
+        ==
+        old_cfg.n_embd // old_cfg.n_head
+    )
 
     generator = torch.Generator(device=old_model.get_device())
     generator.manual_seed(MORPH_RANDOM_SEED)
 
-    # Token embedding: [E, E]. RMSNorm has no learned scale in nanochat, and
-    # RMS([x,x]) == RMS(x), so normalized activations are duplicated exactly.
+    # -------------------------------------------------------------------------
+    # Token embedding
+    # -------------------------------------------------------------------------
+
     old_wte = old_model.transformer.wte.weight.detach().float()
+
+    widened_wte = torch.cat([
+        old_wte,
+        old_wte,
+    ], dim=1)
+
+    widened_wte += _rand_relative_to(
+        widened_wte,
+        output_noise_gain,
+        generator,
+    )
+
     new_model.transformer.wte.weight.copy_(
-        torch.cat([old_wte, old_wte], dim=1).to(new_model.transformer.wte.weight.dtype)
+        widened_wte.to(new_model.transformer.wte.weight.dtype)
     )
 
-    # Output head averages the two residual halves.
+    # -------------------------------------------------------------------------
+    # Output head
+    #
+    # Base mapping averages the duplicated residual halves:
+    #
+    #     [0.5 W, 0.5 W]
+    #
+    # Then perturb it slightly so logits are not exactly preserved.
+    # -------------------------------------------------------------------------
+
     old_head = old_model.lm_head.weight.detach().float()
-    new_model.lm_head.weight.copy_(
-        torch.cat([0.5 * old_head, 0.5 * old_head], dim=1).to(new_model.lm_head.weight.dtype)
+
+    widened_head = torch.cat([
+        0.5 * old_head,
+        0.5 * old_head,
+    ], dim=1)
+
+    widened_head += _rand_relative_to(
+        widened_head,
+        output_noise_gain,
+        generator,
     )
 
-    for old_block, new_block in zip(old_model.transformer.h, new_model.transformer.h):
-        # Q/K/V: doubled head count, canceling random perturbations.
+    new_model.lm_head.weight.copy_(
+        widened_head.to(new_model.lm_head.weight.dtype)
+    )
+
+    # -------------------------------------------------------------------------
+    # Transformer blocks
+    # -------------------------------------------------------------------------
+
+    for old_block, new_block in zip(
+        old_model.transformer.h,
+        new_model.transformer.h,
+    ):
+
+        # ---------------------------------------------------------------------
+        # Q / K / V
+        # ---------------------------------------------------------------------
+
         for attr in ("c_q", "c_k", "c_v"):
-            old_w = getattr(old_block.attn, attr).weight
-            new_w = _morph_qkv_double_heads(old_w, gain, generator)
-            getattr(new_block.attn, attr).weight.copy_(
-                new_w.to(getattr(new_block.attn, attr).weight.dtype)
+
+            old_w = getattr(
+                old_block.attn,
+                attr,
+            ).weight
+
+            new_w = _morph_qkv_double_heads(
+                old_w,
+                gain,
+                generator,
+                output_noise_gain=output_noise_gain,
             )
 
-        # W_O: preserve the old attention output, duplicate it into both residual
-        # halves, and zero ALL columns belonging to the newly added heads.
+            getattr(
+                new_block.attn,
+                attr,
+            ).weight.copy_(
+                new_w.to(
+                    getattr(
+                        new_block.attn,
+                        attr,
+                    ).weight.dtype
+                )
+            )
+
+        # ---------------------------------------------------------------------
+        # Attention output projection W_O
+        #
+        # Previously:
+        #
+        #     [[W, 0],
+        #      [W, 0]]
+        #
+        # which completely blocked the new heads.
+        #
+        # Now the new-head columns receive a small random matrix, while the
+        # old-head path also gets a tiny perturbation.
+        # ---------------------------------------------------------------------
+
         old_wo = old_block.attn.c_proj.weight.detach().float()
-        d = old_wo.shape[0]
-        new_wo = torch.zeros((2 * d, 2 * d), device=old_wo.device, dtype=torch.float32)
-        new_wo[:d, :d] = old_wo
-        new_wo[d:, :d] = old_wo
-        new_block.attn.c_proj.weight.copy_(new_wo.to(new_block.attn.c_proj.weight.dtype))
 
-        # Value-embedding gate: preserve gates for old heads. The added-head
-        # rows are zero-initialized. Note that nanochat uses sigmoid(gate), so a
-        # zero row is not mathematically a zero VE gate; the actual strict
-        # zero-gating of all NEW head contributions is supplied by W_O above.
+        d_out, d_in = old_wo.shape
+
+        new_wo = torch.zeros(
+            (2 * d_out, 2 * d_in),
+            device=old_wo.device,
+            dtype=torch.float32,
+        )
+
+        # Main old-head contribution.
+        new_wo[:d_out, :d_in] = old_wo
+        new_wo[d_out:, :d_in] = old_wo
+
+        old_norm = torch.linalg.vector_norm(old_wo)
+
+        # New heads get a small but nonzero projection immediately.
+        new_head_noise = _rand_like_shape(
+            (2 * d_out, d_in),
+            device=old_wo.device,
+            target_norm=output_noise_gain * old_norm,
+            generator=generator,
+        )
+
+        new_wo[:, d_in:] = new_head_noise
+
+        # Also perturb the old-head pathway slightly.
+        new_wo[:, :d_in] += _rand_like_shape(
+            (2 * d_out, d_in),
+            device=old_wo.device,
+            target_norm=output_noise_gain * old_norm,
+            generator=generator,
+        )
+
+        new_block.attn.c_proj.weight.copy_(
+            new_wo.to(
+                new_block.attn.c_proj.weight.dtype
+            )
+        )
+
+        # ---------------------------------------------------------------------
+        # Value embedding gate
+        # ---------------------------------------------------------------------
+
         if old_block.attn.ve_gate is not None:
-            old_gate = old_block.attn.ve_gate.weight.detach().float()
-            new_gate = torch.zeros_like(new_block.attn.ve_gate.weight, dtype=torch.float32)
-            new_gate[: old_gate.shape[0], :] = old_gate
+
+            old_gate = (
+                old_block.attn.ve_gate.weight
+                .detach()
+                .float()
+            )
+
+            new_gate = torch.zeros_like(
+                new_block.attn.ve_gate.weight,
+                dtype=torch.float32,
+            )
+
+            old_rows = old_gate.shape[0]
+
+            # Old gates copied with tiny perturbation.
+            old_gate_noisy = old_gate + _rand_relative_to(
+                old_gate,
+                output_noise_gain,
+                generator,
+            )
+
+            new_gate[:old_rows, :] = old_gate_noisy
+
+            # New heads start near zero, but not identically zero.
+            # Since nanochat applies sigmoid afterward, these are still around
+            # sigmoid(0)=0.5 in gate-space. W_O is what keeps their initial
+            # contribution small.
+            new_rows = new_gate.shape[0] - old_rows
+
+            if new_rows > 0:
+                gate_scale = (
+                    torch.linalg.vector_norm(old_gate)
+                    / max(old_gate.numel() ** 0.5, 1.0)
+                )
+
+                new_gate[old_rows:, :] = torch.randn(
+                    new_gate[old_rows:, :].shape,
+                    device=new_gate.device,
+                    dtype=torch.float32,
+                    generator=generator,
+                ) * (
+                    output_noise_gain
+                    * gate_scale
+                )
+
             new_block.attn.ve_gate.weight.copy_(
-                new_gate.to(new_block.attn.ve_gate.weight.dtype)
+                new_gate.to(
+                    new_block.attn.ve_gate.weight.dtype
+                )
             )
 
-        # Both rectangular MLP matrices use the same 2x-by-2x block formula.
+        # ---------------------------------------------------------------------
+        # MLP
+        # ---------------------------------------------------------------------
+
         for attr in ("c_fc", "c_proj"):
-            old_w = getattr(old_block.mlp, attr).weight
-            new_w = _morph_rectangular_double(old_w, gain, generator)
-            getattr(new_block.mlp, attr).weight.copy_(
-                new_w.to(getattr(new_block.mlp, attr).weight.dtype)
+
+            old_w = getattr(
+                old_block.mlp,
+                attr,
+            ).weight
+
+            new_w = _morph_rectangular_double(
+                old_w,
+                gain,
+                generator,
+                output_noise_gain=output_noise_gain,
             )
 
-    # Per-layer learned scalars. There are no learned RMSNorm scale parameters
-    # in current nanochat; RMSNorm itself is parameter-free.
-    new_model.resid_lambdas.copy_(old_model.resid_lambdas)
-    new_model.x0_lambdas.copy_(old_model.x0_lambdas)
-    new_model.smear_lambda.copy_(old_model.smear_lambda)
-    new_model.backout_lambda.copy_(old_model.backout_lambda)
-    new_model.smear_gate.weight.copy_(old_model.smear_gate.weight)
+            getattr(
+                new_block.mlp,
+                attr,
+            ).weight.copy_(
+                new_w.to(
+                    getattr(
+                        new_block.mlp,
+                        attr,
+                    ).weight.dtype
+                )
+            )
 
-    # Value embeddings: old head channels are copied exactly, newly added head
-    # channels get a small normalized random table. W_O blocks the new heads
-    # initially, so these random values cannot alter the residual output.
+    # -------------------------------------------------------------------------
+    # Learned scalar parameters
+    #
+    # Preserve them approximately, but introduce tiny symmetry-breaking noise.
+    # -------------------------------------------------------------------------
+
+    def copy_scalar_with_noise(dst, src):
+        src32 = src.detach().float()
+
+        if src32.numel() == 0:
+            dst.copy_(src)
+            return
+
+        noisy = src32 + _rand_relative_to(
+            src32,
+            output_noise_gain,
+            generator,
+        )
+
+        dst.copy_(noisy.to(dst.dtype))
+
+    copy_scalar_with_noise(
+        new_model.resid_lambdas,
+        old_model.resid_lambdas,
+    )
+
+    copy_scalar_with_noise(
+        new_model.x0_lambdas,
+        old_model.x0_lambdas,
+    )
+
+    copy_scalar_with_noise(
+        new_model.smear_lambda,
+        old_model.smear_lambda,
+    )
+
+    copy_scalar_with_noise(
+        new_model.backout_lambda,
+        old_model.backout_lambda,
+    )
+
+    # smear_gate is a matrix-like parameter.
+    old_smear_gate = (
+        old_model.smear_gate.weight
+        .detach()
+        .float()
+    )
+
+    new_smear_gate = old_smear_gate + _rand_relative_to(
+        old_smear_gate,
+        output_noise_gain,
+        generator,
+    )
+
+    new_model.smear_gate.weight.copy_(
+        new_smear_gate.to(
+            new_model.smear_gate.weight.dtype
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Value embeddings
+    #
+    # Old part is copied with small perturbation.
+    # New part is random with a norm proportional to the old table.
+    # -------------------------------------------------------------------------
+
     for key, old_ve in old_model.value_embeds.items():
+
         new_ve = new_model.value_embeds[key]
-        old_table = old_ve.weight.detach().float()
-        random_table = _rand_relative_to(old_table, gain, generator)
-        morphed_table = torch.cat([old_table, random_table], dim=1)
-        new_ve.weight.copy_(morphed_table.to(new_ve.weight.dtype))
+
+        old_table = (
+            old_ve.weight
+            .detach()
+            .float()
+        )
+
+        old_table_noisy = old_table + _rand_relative_to(
+            old_table,
+            output_noise_gain,
+            generator,
+        )
+
+        random_table = _rand_relative_to(
+            old_table,
+            gain,
+            generator,
+        )
+
+        morphed_table = torch.cat([
+            old_table_noisy,
+            random_table,
+        ], dim=1)
+
+        new_ve.weight.copy_(
+            morphed_table.to(
+                new_ve.weight.dtype
+            )
+        )
 
 
 # Build the model, move to device, init the weights
@@ -767,7 +1108,7 @@ def grow_batch_and_model_width_2x(current_step):
     old_state = training_state
     old_cfg = old_state.config
     old_batch = total_batch_size
-    new_batch = old_batch * 2
+    new_batch = old_batch * 1 # * 2
 
     if new_batch % world_tokens_per_fwdbwd != 0:
         raise ValueError(
@@ -1038,6 +1379,12 @@ while True:
             print0(
                 f"Wall-clock limit reached: {total_training_time:.2f}s "
                 f">= {args.max_wall_clock_time:.2f}s. Stopping training."
+            )
+            # Save the morphed wider model too.
+            raw_root = os.path.join(checkpoint_dir, "raw_params")
+            SaveModelAsRawParams(
+                model,
+                os.path.join(raw_root, f"step_{current_step:05d}_final"),
             )
         break
 
