@@ -5,7 +5,6 @@ import csv
 import json
 import os
 import sys
-from dataclasses import asdict, is_dataclass
 from typing import Any
 
 import torch
@@ -37,8 +36,9 @@ class ExperimentLogger:
     """Owns config, text log, metrics CSV, event CSV, and raw parameter paths."""
 
     METRIC_FIELDS = [
-        "step", "num_iterations", "pct_done", "training_loss", "smooth_training_loss",
-        "lrm", "total_batch_size", "device_batch_size", "grad_accum_steps", "dt_ms",
+        "step", "num_iterations", "pct_done", "time_pct_done", "schedule_progress",
+        "training_loss", "smooth_training_loss", "lrm", "total_batch_size",
+        "device_batch_size", "grad_accum_steps", "dt_ms",
         "tok_per_sec", "bf16_mfu", "epoch", "pq_idx", "rg_idx", "training_time_s",
         "process_wall_time_s", "training_tokens_so_far", "total_training_flops",
         "model_n_layer", "model_n_embd", "model_n_head", "model_num_params",

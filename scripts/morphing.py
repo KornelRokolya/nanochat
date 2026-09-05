@@ -180,10 +180,20 @@ def _morph_duplicate(old_model, new_model, gain: float, generator: torch.Generat
             dst = new_block.mlp.c_fc.weight
             dst.copy_(_average_double_matrix(src, gain, generator).to(dst.dtype))
 
-            if old_block.attn.ve_gate is not None and new_block.attn.ve_gate is not None:
-                gate_base = torch.cat((old_block.attn.ve_gate.weight.detach().float(),) * 2, dim=0)
-                gate_base = gate_base + _noise_with_norm(gate_base, gain, generator)
-                new_block.attn.ve_gate.weight.copy_(gate_base.to(new_block.attn.ve_gate.weight.dtype))
+            # Value-embedding availability alternates with layer parity. When depth
+            # doubles, every pair contains exactly one VE-capable target layer.
+            # Copy the old gate only when the source layer actually had a VE;
+            # otherwise keep the target gate neutral/tiny because its VE table is
+            # initialized near zero below.
+            if new_block.attn.ve_gate is not None:
+                if old_block.attn.ve_gate is not None:
+                    gate_base = torch.cat((old_block.attn.ve_gate.weight.detach().float(),) * 2, dim=0)
+                    gate_base = gate_base + _noise_with_norm(gate_base, gain, generator)
+                    new_block.attn.ve_gate.weight.copy_(gate_base.to(new_block.attn.ve_gate.weight.dtype))
+                else:
+                    init_gate = new_block.attn.ve_gate.weight.detach().float()
+                    tiny_gate = _noise_with_norm(init_gate, gain, generator)
+                    new_block.attn.ve_gate.weight.copy_(tiny_gate.to(new_block.attn.ve_gate.weight.dtype))
 
         # Avoid applying the learned residual-stream affine twice. The first
         # copy carries the old layer's scalars; the second copy is neutral.
@@ -192,18 +202,31 @@ def _morph_duplicate(old_model, new_model, gain: float, generator: torch.Generat
         new_model.resid_lambdas[2 * old_i + 1].fill_(1.0)
         new_model.x0_lambdas[2 * old_i + 1].zero_()
 
-    # Value embeddings follow layer mapping. If a target layer has a VE but its
-    # source does not (possible for unusual parity changes), leave Nanochat init.
+    # Value embeddings need special handling because Nanochat enables them on
+    # alternating layers. Under dN->d2N each source block maps to a pair in which
+    # only one target block has a VE.
+    #
+    # If the old block HAD a VE, place a 2x duplicated VE in the one VE-capable
+    # target copy. Each copied block's residual output projection is halved, so
+    # concentrating 2x VE in one copy approximately preserves the pair's total VE
+    # contribution. If the old block had NO VE, initialize the newly appearing VE
+    # at only gain times Nanochat's normal-init Frobenius norm rather than leaving
+    # a full-strength random table that would create a large morph discontinuity.
     for old_i in range(old_layers):
         old_key = str(old_i)
-        if old_key not in old_model.value_embeds:
-            continue
         for copy_idx in (0, 1):
             new_key = str(2 * old_i + copy_idx)
-            if new_key in new_model.value_embeds:
+            if new_key not in new_model.value_embeds:
+                continue
+            dst = new_model.value_embeds[new_key].weight
+            if old_key in old_model.value_embeds:
                 src = old_model.value_embeds[old_key].weight
-                dst = new_model.value_embeds[new_key].weight
-                dst.copy_(_duplicate_last_dim(src, gain, generator).to(dst.dtype))
+                morphed = 2.0 * _duplicate_last_dim(src, gain, generator)
+                dst.copy_(morphed.to(dst.dtype))
+            else:
+                init_ref = dst.detach().float()
+                tiny = _noise_with_norm(init_ref, gain, generator)
+                dst.copy_(tiny.to(dst.dtype))
 
 
 @torch.no_grad()
@@ -215,9 +238,11 @@ def _morph_new_capacity(old_model, new_model, gain: float, generator: torch.Gene
 
     _embed_last_dim(new_model.transformer.wte.weight, old_model.transformer.wte.weight, gain, generator)
     _embed_last_dim(new_model.lm_head.weight, old_model.lm_head.weight, gain, generator)
-    _copy_with_relative_noise(new_model.smear_gate.weight, old_model.smear_gate.weight, gain, generator)
-    _copy_with_relative_noise(new_model.smear_lambda, old_model.smear_lambda, gain, generator)
-    _copy_with_relative_noise(new_model.backout_lambda, old_model.backout_lambda, gain, generator)
+    # These global parameters do not gain any new coordinates when width/depth
+    # grows, so strategy 2 keeps them exactly rather than perturbing trained state.
+    new_model.smear_gate.weight.copy_(old_model.smear_gate.weight)
+    new_model.smear_lambda.copy_(old_model.smear_lambda)
+    new_model.backout_lambda.copy_(old_model.backout_lambda)
 
     # Existing layers occupy the first old_n layers. New layers remain exactly
     # as produced by GPT.init_weights(), per the requested strategy.
