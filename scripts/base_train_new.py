@@ -19,7 +19,7 @@ import time
 import math
 import argparse
 import csv
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
@@ -35,6 +35,8 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+from scripts.morphing import morph_model
+from scripts.experiment_utils import ExperimentLogger, save_model_as_raw_params
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -42,6 +44,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--experiment-name", type=str, default=None, help="experiment folder name under <base_dir>/experiments")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -70,11 +73,19 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 parser.add_argument("--max-wall-clock-time", type=float, default=-1.0, help="hard stop after this many accumulated training seconds; step 0 time is excluded (-1 = disable)")
-parser.add_argument("--resize-wall-clock-time", type=float, default=-1.0, help="at this accumulated training time (seconds), simultaneously double total batch size and model width/head count once; negative disables")
+parser.add_argument("--morph-at-seconds", type=float, default=-1.0, help="morph model once after this much accumulated training time; negative disables")
+parser.add_argument("--morph-target-depth", type=int, default=-1, help="target depth for model morph; e.g. 12 for d6->d12")
+parser.add_argument("--morph-strategy", type=str, default="duplicate", choices=["duplicate", "new_capacity"], help="model growth initialization strategy")
+parser.add_argument("--morph-noise-gain", type=float, default=1e-3, help="Frobenius-relative noise gain used by morphing")
+parser.add_argument("--morph-seed", type=int, default=12345, help="random seed for morph initialization")
+parser.add_argument("--batch-growth-interval-seconds", type=float, default=-1.0, help="double total batch every N accumulated training seconds; negative disables")
+parser.add_argument("--batch-growth-factor", type=int, default=2, help="multiplicative total-batch growth factor")
+parser.add_argument("--batch-growth-start-seconds", type=float, default=-1.0, help="first batch growth time; negative means one interval")
+parser.add_argument("--disable-lr-decay", action="store_true", help="keep LR multiplier at 1 after warmup; disables warmdown only")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
+parser.add_argument("--core-metric-every", type=int, default=1000000000, help="evaluate CORE metric every N steps; default effectively means final-only (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
@@ -97,7 +108,8 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-print0(f"Resize wall-clock time: {args.resize_wall_clock_time}s (negative disables)")
+print0(f"Morph at training time: {args.morph_at_seconds}s (negative disables)")
+print0(f"Batch growth interval: {args.batch_growth_interval_seconds}s (negative disables)")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -148,555 +160,7 @@ def build_model_meta(depth):
 
 
 # -----------------------------------------------------------------------------
-# Online model-width morphing helpers
-#
-# The first implementation deliberately keeps n_layer fixed and doubles n_embd,
-# n_head and n_kv_head. This preserves head_dim and lets us use an exact
-# duplicated-residual construction. Depth growth is a separate problem.
-#
-# Random perturbations are normalized to the Frobenius norm of the source
-# matrix, then multiplied by this hard-coded relative gain.
-MORPH_RANDOM_GAIN = 0.10
-MORPH_RANDOM_SEED = 12345
-
-
-@dataclass
-class TrainingModelState:
-    orig_model: object
-    model: object
-    optimizer: object
-    config: GPTConfig
-    num_params: int
-    num_scaling_params: int
-    num_flops_per_token: float
-    target_tokens: float
-    weight_decay_scaled: float
-
-
-def _safe_param_filename(name):
-    # Keep names Fiji/filesystem friendly while preserving the parameter path.
-    return name.replace(".", "_").replace("/", "_").replace("\\", "_")
-
-
-@torch.no_grad()
-def SaveModelAsRawParams(model_to_save, output_directory):
-    """Write every parameter as a linearized little-endian float32 .raw file.
-
-    2-D tensors are named:
-        {parameterName}_f32_dim0xdim1.raw
-    1-D tensors are represented as Nx1 for easy Fiji Raw Import.
-    Higher-dimensional tensors (if ever added) use all dimensions joined by 'x'.
-
-    PyTorch/NumPy C-order is used: the last dimension varies fastest.
-    """
-    if not master_process:
-        return
-
-    import numpy as np
-
-    os.makedirs(output_directory, exist_ok=True)
-    manifest_path = os.path.join(output_directory, "manifest.csv")
-    with open(manifest_path, "w", newline="", encoding="utf-8") as manifest_file:
-        manifest = csv.writer(manifest_file, delimiter=";")
-        manifest.writerow(["parameter_name", "dtype", "shape", "raw_file"])
-
-        for name, parameter in model_to_save.named_parameters():
-            tensor = parameter.detach().to(device="cpu", dtype=torch.float32).contiguous()
-            shape = tuple(tensor.shape)
-            file_shape = shape if len(shape) != 1 else (shape[0], 1)
-            dims = "x".join(str(d) for d in file_shape)
-            filename = f"{_safe_param_filename(name)}_f32_{dims}.raw"
-            filepath = os.path.join(output_directory, filename)
-
-            array = tensor.numpy().astype("<f4", copy=False)
-            array.tofile(filepath)
-            manifest.writerow([name, "float32_le", "x".join(map(str, shape)), filename])
-
-    print0(f"Saved raw float32 parameters to: {output_directory}")
-
-
-@torch.no_grad()
-def _rand_relative_to(reference, gain, generator):
-    """Random tensor with Frobenius norm = gain * ||reference||_F."""
-    ref32 = reference.detach().float()
-
-    rnd = torch.randn(
-        ref32.shape,
-        device=ref32.device,
-        dtype=torch.float32,
-        generator=generator,
-    )
-
-    rnd_norm = torch.linalg.vector_norm(rnd)
-    ref_norm = torch.linalg.vector_norm(ref32)
-
-    target_norm = gain * (
-        ref_norm
-        if ref_norm > 0
-        else torch.tensor(1.0, device=ref32.device)
-    )
-
-    rnd = rnd / rnd_norm.clamp_min(1e-12) * target_norm
-    return rnd
-
-
-@torch.no_grad()
-def _rand_like_shape(shape, device, target_norm, generator):
-    """Generate random float32 tensor of given shape with chosen Frobenius norm."""
-    rnd = torch.randn(
-        shape,
-        device=device,
-        dtype=torch.float32,
-        generator=generator,
-    )
-
-    rnd_norm = torch.linalg.vector_norm(rnd)
-
-    return rnd / rnd_norm.clamp_min(1e-12) * target_norm
-
-
-@torch.no_grad()
-def _morph_rectangular_double(
-    weight,
-    gain,
-    generator,
-    output_noise_gain=0.01,
-):
-    """For W:[m,n], create a [2m,2n] widened matrix.
-
-    Main symmetry-breaking construction:
-
-        [[0.5W + A, 0.5W - A],
-         [0.5W + B, 0.5W - B]]
-
-    Then add a much smaller unrestricted perturbation E, so the mapping is
-    intentionally no longer exactly function preserving.
-
-    For duplicated input [x,x], without E the result would be [Wx,Wx].
-    """
-
-    W = weight.detach().float()
-
-    A = _rand_relative_to(W, gain, generator)
-    B = _rand_relative_to(W, gain, generator)
-
-    half_W = 0.5 * W
-
-    top = torch.cat([
-        half_W + A,
-        half_W - A,
-    ], dim=1)
-
-    bottom = torch.cat([
-        half_W + B,
-        half_W - B,
-    ], dim=1)
-
-    widened = torch.cat([top, bottom], dim=0)
-
-    # Small non-canceling perturbation.
-    E = _rand_relative_to(
-        widened,
-        output_noise_gain,
-        generator,
-    )
-
-    return widened + E
-
-
-@torch.no_grad()
-def _morph_qkv_double_heads(
-    weight,
-    gain,
-    generator,
-    output_noise_gain=0.01,
-):
-    """Double Q/K/V width and head count.
-
-    Uses the structured widening construction plus a small unrestricted
-    perturbation so both old and new heads begin slightly displaced from the
-    original function.
-    """
-
-    return _morph_rectangular_double(
-        weight,
-        gain,
-        generator,
-        output_noise_gain=output_noise_gain,
-    )
-
-
-@torch.no_grad()
-def morph_model_width_2x(
-    old_model,
-    new_model,
-    gain=MORPH_RANDOM_GAIN,
-    output_noise_gain=0.01,
-):
-    """Widen nanochat model by 2x with deliberate small function perturbations.
-
-    Strategy:
-      * token embedding: duplicate old embedding + small random perturbation
-      * Q/K/V: structured 2x widening + small non-canceling perturbation
-      * W_O: preserve old heads approximately, initialize new-head contribution
-             with a small random matrix instead of exact zero
-      * MLP c_fc/c_proj: structured widening + non-canceling perturbation
-      * lm_head: average the duplicated residual halves + small random perturbation
-      * value embeddings: copy old channels + random new channels, and slightly
-                          perturb old channels too
-      * value gates: copy old gate rows with small noise; initialize new rows
-                     near zero with small random values
-      * scalar parameters: copy + very small perturbation
-
-    This is intentionally NOT exactly function preserving.
-    """
-
-    old_cfg = old_model.config
-    new_cfg = new_model.config
-
-    assert new_cfg.n_layer == old_cfg.n_layer, \
-        "This morph keeps depth fixed."
-
-    assert new_cfg.n_embd == 2 * old_cfg.n_embd
-    assert new_cfg.n_head == 2 * old_cfg.n_head
-    assert new_cfg.n_kv_head == 2 * old_cfg.n_kv_head
-
-    assert (
-        new_cfg.n_embd // new_cfg.n_head
-        ==
-        old_cfg.n_embd // old_cfg.n_head
-    )
-
-    generator = torch.Generator(device=old_model.get_device())
-    generator.manual_seed(MORPH_RANDOM_SEED)
-
-    # -------------------------------------------------------------------------
-    # Token embedding
-    # -------------------------------------------------------------------------
-
-    old_wte = old_model.transformer.wte.weight.detach().float()
-
-    widened_wte = torch.cat([
-        old_wte,
-        old_wte,
-    ], dim=1)
-
-    widened_wte += _rand_relative_to(
-        widened_wte,
-        output_noise_gain,
-        generator,
-    )
-
-    new_model.transformer.wte.weight.copy_(
-        widened_wte.to(new_model.transformer.wte.weight.dtype)
-    )
-
-    # -------------------------------------------------------------------------
-    # Output head
-    #
-    # Base mapping averages the duplicated residual halves:
-    #
-    #     [0.5 W, 0.5 W]
-    #
-    # Then perturb it slightly so logits are not exactly preserved.
-    # -------------------------------------------------------------------------
-
-    old_head = old_model.lm_head.weight.detach().float()
-
-    widened_head = torch.cat([
-        0.5 * old_head,
-        0.5 * old_head,
-    ], dim=1)
-
-    widened_head += _rand_relative_to(
-        widened_head,
-        output_noise_gain,
-        generator,
-    )
-
-    new_model.lm_head.weight.copy_(
-        widened_head.to(new_model.lm_head.weight.dtype)
-    )
-
-    # -------------------------------------------------------------------------
-    # Transformer blocks
-    # -------------------------------------------------------------------------
-
-    for old_block, new_block in zip(
-        old_model.transformer.h,
-        new_model.transformer.h,
-    ):
-
-        # ---------------------------------------------------------------------
-        # Q / K / V
-        # ---------------------------------------------------------------------
-
-        for attr in ("c_q", "c_k", "c_v"):
-
-            old_w = getattr(
-                old_block.attn,
-                attr,
-            ).weight
-
-            new_w = _morph_qkv_double_heads(
-                old_w,
-                gain,
-                generator,
-                output_noise_gain=output_noise_gain,
-            )
-
-            getattr(
-                new_block.attn,
-                attr,
-            ).weight.copy_(
-                new_w.to(
-                    getattr(
-                        new_block.attn,
-                        attr,
-                    ).weight.dtype
-                )
-            )
-
-        # ---------------------------------------------------------------------
-        # Attention output projection W_O
-        #
-        # Previously:
-        #
-        #     [[W, 0],
-        #      [W, 0]]
-        #
-        # which completely blocked the new heads.
-        #
-        # Now the new-head columns receive a small random matrix, while the
-        # old-head path also gets a tiny perturbation.
-        # ---------------------------------------------------------------------
-
-        old_wo = old_block.attn.c_proj.weight.detach().float()
-
-        d_out, d_in = old_wo.shape
-
-        new_wo = torch.zeros(
-            (2 * d_out, 2 * d_in),
-            device=old_wo.device,
-            dtype=torch.float32,
-        )
-
-        # Main old-head contribution.
-        new_wo[:d_out, :d_in] = old_wo
-        new_wo[d_out:, :d_in] = old_wo
-
-        old_norm = torch.linalg.vector_norm(old_wo)
-
-        # New heads get a small but nonzero projection immediately.
-        new_head_noise = _rand_like_shape(
-            (2 * d_out, d_in),
-            device=old_wo.device,
-            target_norm=output_noise_gain * old_norm,
-            generator=generator,
-        )
-
-        new_wo[:, d_in:] = new_head_noise
-
-        # Also perturb the old-head pathway slightly.
-        new_wo[:, :d_in] += _rand_like_shape(
-            (2 * d_out, d_in),
-            device=old_wo.device,
-            target_norm=output_noise_gain * old_norm,
-            generator=generator,
-        )
-
-        new_block.attn.c_proj.weight.copy_(
-            new_wo.to(
-                new_block.attn.c_proj.weight.dtype
-            )
-        )
-
-        # ---------------------------------------------------------------------
-        # Value embedding gate
-        # ---------------------------------------------------------------------
-
-        if old_block.attn.ve_gate is not None:
-
-            old_gate = (
-                old_block.attn.ve_gate.weight
-                .detach()
-                .float()
-            )
-
-            new_gate = torch.zeros_like(
-                new_block.attn.ve_gate.weight,
-                dtype=torch.float32,
-            )
-
-            old_rows = old_gate.shape[0]
-
-            # Old gates copied with tiny perturbation.
-            old_gate_noisy = old_gate + _rand_relative_to(
-                old_gate,
-                output_noise_gain,
-                generator,
-            )
-
-            new_gate[:old_rows, :] = old_gate_noisy
-
-            # New heads start near zero, but not identically zero.
-            # Since nanochat applies sigmoid afterward, these are still around
-            # sigmoid(0)=0.5 in gate-space. W_O is what keeps their initial
-            # contribution small.
-            new_rows = new_gate.shape[0] - old_rows
-
-            if new_rows > 0:
-                gate_scale = (
-                    torch.linalg.vector_norm(old_gate)
-                    / max(old_gate.numel() ** 0.5, 1.0)
-                )
-
-                new_gate[old_rows:, :] = torch.randn(
-                    new_gate[old_rows:, :].shape,
-                    device=new_gate.device,
-                    dtype=torch.float32,
-                    generator=generator,
-                ) * (
-                    output_noise_gain
-                    * gate_scale
-                )
-
-            new_block.attn.ve_gate.weight.copy_(
-                new_gate.to(
-                    new_block.attn.ve_gate.weight.dtype
-                )
-            )
-
-        # ---------------------------------------------------------------------
-        # MLP
-        # ---------------------------------------------------------------------
-
-        for attr in ("c_fc", "c_proj"):
-
-            old_w = getattr(
-                old_block.mlp,
-                attr,
-            ).weight
-
-            new_w = _morph_rectangular_double(
-                old_w,
-                gain,
-                generator,
-                output_noise_gain=output_noise_gain,
-            )
-
-            getattr(
-                new_block.mlp,
-                attr,
-            ).weight.copy_(
-                new_w.to(
-                    getattr(
-                        new_block.mlp,
-                        attr,
-                    ).weight.dtype
-                )
-            )
-
-    # -------------------------------------------------------------------------
-    # Learned scalar parameters
-    #
-    # Preserve them approximately, but introduce tiny symmetry-breaking noise.
-    # -------------------------------------------------------------------------
-
-    def copy_scalar_with_noise(dst, src):
-        src32 = src.detach().float()
-
-        if src32.numel() == 0:
-            dst.copy_(src)
-            return
-
-        noisy = src32 + _rand_relative_to(
-            src32,
-            output_noise_gain,
-            generator,
-        )
-
-        dst.copy_(noisy.to(dst.dtype))
-
-    copy_scalar_with_noise(
-        new_model.resid_lambdas,
-        old_model.resid_lambdas,
-    )
-
-    copy_scalar_with_noise(
-        new_model.x0_lambdas,
-        old_model.x0_lambdas,
-    )
-
-    copy_scalar_with_noise(
-        new_model.smear_lambda,
-        old_model.smear_lambda,
-    )
-
-    copy_scalar_with_noise(
-        new_model.backout_lambda,
-        old_model.backout_lambda,
-    )
-
-    # smear_gate is a matrix-like parameter.
-    old_smear_gate = (
-        old_model.smear_gate.weight
-        .detach()
-        .float()
-    )
-
-    new_smear_gate = old_smear_gate + _rand_relative_to(
-        old_smear_gate,
-        output_noise_gain,
-        generator,
-    )
-
-    new_model.smear_gate.weight.copy_(
-        new_smear_gate.to(
-            new_model.smear_gate.weight.dtype
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Value embeddings
-    #
-    # Old part is copied with small perturbation.
-    # New part is random with a norm proportional to the old table.
-    # -------------------------------------------------------------------------
-
-    for key, old_ve in old_model.value_embeds.items():
-
-        new_ve = new_model.value_embeds[key]
-
-        old_table = (
-            old_ve.weight
-            .detach()
-            .float()
-        )
-
-        old_table_noisy = old_table + _rand_relative_to(
-            old_table,
-            output_noise_gain,
-            generator,
-        )
-
-        random_table = _rand_relative_to(
-            old_table,
-            gain,
-            generator,
-        )
-
-        morphed_table = torch.cat([
-            old_table_noisy,
-            random_table,
-        ], dim=1)
-
-        new_ve.weight.copy_(
-            morphed_table.to(
-                new_ve.weight.dtype
-            )
-        )
-
+# Morphing and experiment I/O live in scripts/morphing.py and scripts/experiment_utils.py.
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
@@ -708,47 +172,26 @@ model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
+experiment_name = args.experiment_name or output_dirname
+experiment_dir = os.path.join(base_dir, "experiments", experiment_name)
 resuming = args.resume_from_step != -1
-
-# Per-step semicolon-separated training log. Only rank 0 writes it.
-# New runs overwrite the file; resumed runs append to it.
-training_csv_path = os.path.join(checkpoint_dir, "training_log.csv")
-training_csv_file = None
-training_csv_writer = None
+experiment_logger = ExperimentLogger(experiment_dir, master_process, append=resuming)
+checkpoint_dir = experiment_logger.checkpoint_dir
+process_start_time = time.time()
 if master_process:
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    csv_mode = "a" if resuming and os.path.exists(training_csv_path) else "w"
-    training_csv_file = open(training_csv_path, csv_mode, newline="", encoding="utf-8", buffering=1)
-    training_csv_writer = csv.writer(training_csv_file, delimiter=";")
-    if csv_mode == "w":
-        training_csv_writer.writerow([
-            "step",
-            "num_iterations",
-            "pct_done",
-            "training_loss",
-            "lrm",
-            "total_batch_size",
-            "grad_accum_steps",
-            "dt_ms",
-            "tok_per_sec",
-            "bf16_mfu",
-            "epoch",
-            "pq_idx",
-            "rg_idx",
-            "total_training_time_s",
-            "total_training_time_ms",
-            "eta_s",
-            "eta_min",
-            "training_tokens_so_far",
-            "total_training_flops",
-            "model_n_layer",
-            "model_n_embd",
-            "model_n_head",
-            "model_num_params",
-        ])
-    print0(f"Training CSV: {training_csv_path}")
+    experiment_logger.save_config({
+        **user_config,
+        "resolved_experiment_name": experiment_name,
+        "experiment_dir": experiment_dir,
+        "initial_model_config": model_config_kwargs,
+        "gpu": gpu_device_name if device_type == "cuda" else device_type,
+        "world_size": ddp_world_size,
+    })
+print0(f"Experiment directory: {experiment_dir}")
+print0(f"Metrics CSV: {os.path.join(experiment_dir, 'metrics.csv')}")
+print0(f"Events CSV: {os.path.join(experiment_dir, 'events.csv')}")
+print0(f"Text log: {os.path.join(experiment_dir, 'log.txt')}")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -989,18 +432,33 @@ total_tokens = total_batch_size * num_iterations
 print0(f"Initial-batch token estimate: {total_tokens:,} (changes if the online batch schedule triggers)")
 print0(f"Initial-batch Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}")
 print0(f"Initial-batch training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+if master_process:
+    experiment_logger.save_config({
+        **user_config,
+        "resolved_experiment_name": experiment_name,
+        "experiment_dir": experiment_dir,
+        "initial_model_config": model_config_kwargs,
+        "gpu": gpu_device_name if device_type == "cuda" else device_type,
+        "world_size": ddp_world_size,
+        "resolved_total_batch_size": total_batch_size,
+        "resolved_grad_accum_steps": total_batch_size // (args.device_batch_size * args.max_seq_len * ddp_world_size),
+        "resolved_num_iterations": num_iterations,
+        "resolved_target_tokens": target_tokens,
+        "resolved_weight_decay": weight_decay_scaled,
+    })
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
+    if warmup_iters > 0 and it < warmup_iters:
         return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
+    if args.disable_lr_decay:
         return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    if warmdown_iters <= 0 or it <= num_iterations - warmdown_iters:
+        return 1.0
+    progress = max(0.0, (num_iterations - it) / warmdown_iters)
+    return progress + (1 - progress) * args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
@@ -1031,7 +489,14 @@ if not resuming:
     total_training_time = 0 # total wall-clock time of training
     training_tokens_so_far = 0 # actual tokens consumed; required once batch size can change
     training_flops_so_far = 0.0 # actual cumulative FLOPs; model FLOPs/token can change online
-    growth_event_done = False
+    morph_event_done = False
+    batch_growth_events = 0
+    first_batch_growth_time = (
+        args.batch_growth_start_seconds
+        if args.batch_growth_start_seconds >= 0
+        else args.batch_growth_interval_seconds
+    )
+    next_batch_growth_time = first_batch_growth_time
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -1045,7 +510,17 @@ else:
         "training_flops_so_far",
         num_flops_per_token * training_tokens_so_far,
     )
-    growth_event_done = loop_state.get("growth_event_done", False)
+    morph_event_done = loop_state.get("morph_event_done", loop_state.get("growth_event_done", False))
+    batch_growth_events = loop_state.get("batch_growth_events", 0)
+    first_batch_growth_time = (
+        args.batch_growth_start_seconds
+        if args.batch_growth_start_seconds >= 0
+        else args.batch_growth_interval_seconds
+    )
+    next_batch_growth_time = loop_state.get(
+        "next_batch_growth_time",
+        first_batch_growth_time + batch_growth_events * max(args.batch_growth_interval_seconds, 0.0),
+    )
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step.
 # IMPORTANT: the dataloader's device batch size stays fixed. Online total-batch growth is implemented
@@ -1074,120 +549,144 @@ def _tag_batch_scaled_optimizer_groups(model_for_optimizer, optimizer_for_model)
 
 
 # Wrap the live model/optimizer and model-dependent accounting in one object.
-training_state = TrainingModelState(
-    orig_model=orig_model,
-    model=model,
-    optimizer=optimizer,
-    config=model_config,
-    num_params=num_params,
-    num_scaling_params=num_scaling_params,
-    num_flops_per_token=num_flops_per_token,
-    target_tokens=target_tokens,
+from types import SimpleNamespace
+training_state = SimpleNamespace(
+    orig_model=orig_model, model=model, optimizer=optimizer, config=model_config,
+    num_params=num_params, num_scaling_params=num_scaling_params,
+    num_flops_per_token=num_flops_per_token, target_tokens=target_tokens,
     weight_decay_scaled=weight_decay_scaled,
 )
 
 
-def grow_batch_and_model_width_2x(current_step):
-    """Atomically double total batch size and model width/head count once.
+def _recompute_batch_dependent_hparams(new_total_batch_size):
+    """Update live batch size, accumulation, LR base scales and Muon WD without touching model size."""
+    global total_batch_size, grad_accum_steps, weight_decay_scaled
+    if new_total_batch_size % world_tokens_per_fwdbwd != 0:
+        raise ValueError(
+            f"total batch size {new_total_batch_size:,} must be a multiple of "
+            f"{world_tokens_per_fwdbwd:,} tokens/micro-step"
+        )
+    old_total_batch_size = total_batch_size
+    old_scale = math.sqrt(old_total_batch_size / B_REF)
+    new_scale = math.sqrt(new_total_batch_size / B_REF)
+    lr_ratio = new_scale / old_scale
+    total_batch_size = new_total_batch_size
+    grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+    weight_decay_scaled = (
+        args.weight_decay
+        * math.sqrt(total_batch_size / B_REF)
+        * (D_REF / target_tokens)
+    )
+    # Preserve optimizer state. Only adjust the batch-scaled groups' base LR.
+    for group in optimizer.param_groups:
+        if group.get("_batch_lr_scaled", True):
+            group["initial_lr"] *= lr_ratio
+    return lr_ratio
 
-    The LR *schedule multiplier* is untouched. A new optimizer is constructed
-    because the parameter tensors have new shapes. Its base LRs are recalculated
-    from the new batch size and new d_model; the current global lrm is then
-    applied. Optimizer moments are intentionally restarted for this first test.
-    """
+
+def grow_batch_only(current_step):
+    """Increase total batch independently of model growth, preserving optimizer state."""
+    global batch_growth_events, next_batch_growth_time
+    old_batch = total_batch_size
+    new_batch = old_batch * args.batch_growth_factor
+    lr_ratio = _recompute_batch_dependent_hparams(new_batch)
+    batch_growth_events += 1
+    next_batch_growth_time += args.batch_growth_interval_seconds
+    details = {
+        "old_total_batch_size": old_batch,
+        "new_total_batch_size": total_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "lr_base_ratio": lr_ratio,
+        "event_index": batch_growth_events,
+    }
+    print0(
+        f"BATCH GROWTH at {total_training_time:.3f}s, step {current_step}: "
+        f"B {old_batch:,}->{total_batch_size:,}, accum={grad_accum_steps}, LR base x{lr_ratio:.6f}"
+    )
+    experiment_logger.event(total_training_time, time.time() - process_start_time, current_step, "batch_growth", details)
+
+
+def morph_model_to_target(current_step):
+    """Morph model only. Batch size is deliberately unchanged."""
     global training_state
     global orig_model, model, optimizer, model_config, model_config_kwargs
     global num_params, num_scaling_params, num_flops_per_token, target_tokens
-    global total_batch_size, grad_accum_steps, weight_decay_scaled
+    global weight_decay_scaled
 
     if args.fp8:
-        raise NotImplementedError(
-            "Online width morphing is intentionally disabled for --fp8 in this first implementation."
-        )
+        raise NotImplementedError("Online model morphing is disabled with --fp8 for now.")
+    if args.morph_target_depth <= 0:
+        raise ValueError("--morph-target-depth must be provided when --morph-at-seconds is enabled")
 
     old_state = training_state
     old_cfg = old_state.config
-    old_batch = total_batch_size
-    new_batch = old_batch * 4
-
-    if new_batch % world_tokens_per_fwdbwd != 0:
-        raise ValueError(
-            f"new total batch size {new_batch:,} must be a multiple of "
-            f"{world_tokens_per_fwdbwd:,} tokens/micro-step"
-        )
-
-    new_cfg = GPTConfig(
-        sequence_len=old_cfg.sequence_len,
-        vocab_size=old_cfg.vocab_size,
-        n_layer=old_cfg.n_layer,
-        n_head=old_cfg.n_head * 2,
-        n_kv_head=old_cfg.n_kv_head * 2,
-        n_embd=old_cfg.n_embd * 2,
-        window_pattern=old_cfg.window_pattern,
-    )
+    target_meta = build_model_meta(args.morph_target_depth)
+    new_cfg = target_meta.config
 
     print0("=" * 80)
     print0(
-        f"GROWTH EVENT at training time {total_training_time:.3f}s, step {current_step}: "
-        f"B {old_batch:,}->{new_batch:,}; "
-        f"d_model {old_cfg.n_embd}->{new_cfg.n_embd}; "
-        f"heads {old_cfg.n_head}->{new_cfg.n_head}; "
-        f"layers stay {old_cfg.n_layer}"
+        f"MORPH EVENT at {total_training_time:.3f}s, step {current_step}: "
+        f"d{old_cfg.n_layer}->d{new_cfg.n_layer}, d_model {old_cfg.n_embd}->{new_cfg.n_embd}, "
+        f"heads {old_cfg.n_head}->{new_cfg.n_head}, strategy={args.morph_strategy}, "
+        f"gain={args.morph_noise_gain:g}; batch stays {total_batch_size:,}"
     )
 
-    # Save the exact pre-morph parameters for Fiji inspection.
-    raw_root = os.path.join(checkpoint_dir, "raw_params")
-    SaveModelAsRawParams(
+    save_model_as_raw_params(
         old_state.orig_model,
-        os.path.join(raw_root, f"step_{current_step:05d}_pre_morph"),
+        os.path.join(experiment_logger.raw_root, f"step_{current_step:05d}_pre_morph"),
+        enabled=master_process,
     )
 
-    # Construct and initialize the wider model. init_weights() also materializes
-    # rotary buffers correctly; all learned parameters are overwritten below.
-    with torch.device("meta"):
-        new_orig_model = GPT(new_cfg)
+    new_orig_model = target_meta
     new_orig_model.to_empty(device=device)
     new_orig_model.init_weights()
-
-    morph_model_width_2x(
+    report = morph_model(
         old_state.orig_model,
         new_orig_model,
-        gain=MORPH_RANDOM_GAIN,
+        strategy=args.morph_strategy,
+        noise_gain=args.morph_noise_gain,
+        seed=args.morph_seed,
     )
 
-    # Cheap function-preservation sanity check on a small prefix.
-    # This is outside total_training_time by design (only optimizer-step dt is accumulated).
+    # Measure discontinuity before any optimizer step.
     check_T = min(256, x.shape[1])
     with torch.no_grad():
-        old_check_loss = old_state.orig_model(x[:1, :check_T], y[:1, :check_T]).float().item()
-        new_check_loss = new_orig_model(x[:1, :check_T], y[:1, :check_T]).float().item()
+        old_loss = old_state.orig_model(x[:1, :check_T], y[:1, :check_T]).float().item()
+        new_loss = new_orig_model(x[:1, :check_T], y[:1, :check_T]).float().item()
+        old_logits = old_state.orig_model(x[:1, :check_T])
+        new_logits = new_orig_model(x[:1, :check_T])
+        rel_l2 = (
+            torch.linalg.vector_norm((new_logits - old_logits).float())
+            / torch.linalg.vector_norm(old_logits.float()).clamp_min(1e-12)
+        ).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            old_logits.float().reshape(1, -1), new_logits.float().reshape(1, -1), dim=1
+        ).item()
+    del old_logits, new_logits
+
     print0(
-        f"Morph check loss on 1x{check_T}: "
-        f"old={old_check_loss:.9f}, new={new_check_loss:.9f}, "
-        f"abs_diff={abs(new_check_loss - old_check_loss):.3e}"
+        f"Morph check 1x{check_T}: old_loss={old_loss:.9f}, new_loss={new_loss:.9f}, "
+        f"loss_jump={new_loss-old_loss:+.3e}, logits_relL2={rel_l2:.3e}, cosine={cosine:.6f}"
     )
-
-    # Save the morphed wider model too.
-    SaveModelAsRawParams(
+    save_model_as_raw_params(
         new_orig_model,
-        os.path.join(raw_root, f"step_{current_step:05d}_post_morph"),
+        os.path.join(experiment_logger.raw_root, f"step_{current_step:05d}_post_morph"),
+        enabled=master_process,
     )
 
-    # Recompute model-dependent scaling quantities.
     new_param_counts = new_orig_model.num_scaling_params()
     new_num_params = new_param_counts["total"]
     new_num_scaling_params = get_scaling_params(new_orig_model)
     new_num_flops_per_token = new_orig_model.estimate_flops()
     new_target_tokens = int(args.target_param_data_ratio * new_num_scaling_params)
-
-    new_batch_lr_scale = math.sqrt(new_batch / B_REF)
+    new_batch_lr_scale = math.sqrt(total_batch_size / B_REF)
     new_weight_decay_scaled = (
         args.weight_decay
-        * math.sqrt(new_batch / B_REF)
+        * math.sqrt(total_batch_size / B_REF)
         * (D_REF / new_target_tokens)
     )
 
-    # Old optimizer state points at old tensors and is intentionally discarded.
+    # Optimizer restart is intentional for today's morph experiments.
     old_state.optimizer = None
     old_state.model = None
     gc.collect()
@@ -1202,64 +701,49 @@ def grow_batch_and_model_width_2x(current_step):
         weight_decay=new_weight_decay_scaled,
     )
     _tag_batch_scaled_optimizer_groups(new_orig_model, new_optimizer)
-
-    # Keep the existing LR schedule phase. Do not restart or alter warmup/warmdown.
     current_lrm = get_lr_multiplier(current_step)
-    current_muon_momentum = get_muon_momentum(current_step)
-    current_muon_weight_decay = (
-        new_weight_decay_scaled
-        * 0.5
-        * (1 + math.cos(math.pi * current_step / num_iterations))
-    )
     for group in new_optimizer.param_groups:
         group["lr"] = group["initial_lr"] * current_lrm
         if group["kind"] == "muon":
-            group["momentum"] = current_muon_momentum
-            group["weight_decay"] = current_muon_weight_decay
+            group["momentum"] = get_muon_momentum(current_step)
+            group["weight_decay"] = new_weight_decay_scaled * 0.5 * (
+                1 + math.cos(math.pi * current_step / num_iterations)
+            )
 
     new_model = torch.compile(new_orig_model, dynamic=False)
-
-    # Publish the new live state atomically.
-    total_batch_size = new_batch
-    grad_accum_steps = new_batch // world_tokens_per_fwdbwd
-
-    orig_model = new_orig_model
-    model = new_model
-    optimizer = new_optimizer
-    model_config = new_cfg
-    model_config_kwargs = asdict(new_cfg)
+    orig_model, model, optimizer = new_orig_model, new_model, new_optimizer
+    model_config, model_config_kwargs = new_cfg, asdict(new_cfg)
     num_params = new_num_params
     num_scaling_params = new_num_scaling_params
     num_flops_per_token = new_num_flops_per_token
     target_tokens = new_target_tokens
     weight_decay_scaled = new_weight_decay_scaled
-
-    training_state = TrainingModelState(
-        orig_model=orig_model,
-        model=model,
-        optimizer=optimizer,
-        config=model_config,
-        num_params=num_params,
-        num_scaling_params=num_scaling_params,
-        num_flops_per_token=num_flops_per_token,
-        target_tokens=target_tokens,
+    training_state = SimpleNamespace(
+        orig_model=orig_model, model=model, optimizer=optimizer, config=model_config,
+        num_params=num_params, num_scaling_params=num_scaling_params,
+        num_flops_per_token=num_flops_per_token, target_tokens=target_tokens,
         weight_decay_scaled=weight_decay_scaled,
     )
 
-    # Release the old model only after morphing and optimizer replacement are done.
+    details = report.to_dict()
+    details.update({
+        "check_tokens": check_T,
+        "loss_before": old_loss,
+        "loss_after": new_loss,
+        "loss_jump": new_loss - old_loss,
+        "logits_relative_l2": rel_l2,
+        "logits_cosine": cosine,
+        "total_batch_size": total_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+    })
+    experiment_logger.event(total_training_time, time.time() - process_start_time, current_step, "morph", details)
+
     old_state.orig_model = None
     del old_state
     gc.collect()
     if device_type == "cuda":
         torch.cuda.empty_cache()
-
-    print0(
-        f"Growth complete | params={num_params:,} | "
-        f"FLOPs/token={num_flops_per_token:.6e} | "
-        f"B={total_batch_size:,} | accum={grad_accum_steps} | "
-        f"batch_lr_scale={new_batch_lr_scale:.6f} | "
-        f"current_lrm={current_lrm:.6f}"
-    )
+    print0(f"Morph complete | params={num_params:,} | FLOPs/token={num_flops_per_token:.6e}")
     print0("=" * 80)
 
 
@@ -1274,17 +758,24 @@ while True:
     # but the normal end-of-run evaluation/checkpoint path is still executed.
     last_step = (step == num_iterations) or wall_clock_limit_reached
 
-    # -------------------------------------------------------------------------
-    # One-time joint growth event, keyed to accumulated *training-step* wall time.
-    # Step 0 is excluded from that accumulator, matching --max-wall-clock-time.
+    # Independent wall-clock-triggered interventions. Step 0 is excluded from
+    # total_training_time, matching --max-wall-clock-time.
     if (
         not last_step
-        and args.resize_wall_clock_time >= 0
-        and not growth_event_done
-        and total_training_time >= args.resize_wall_clock_time
+        and args.morph_at_seconds >= 0
+        and not morph_event_done
+        and total_training_time >= args.morph_at_seconds
     ):
-        grow_batch_and_model_width_2x(current_step=step)
-        growth_event_done = True
+        morph_model_to_target(current_step=step)
+        morph_event_done = True
+
+    while (
+        not last_step
+        and args.batch_growth_interval_seconds > 0
+        and next_batch_growth_time >= 0
+        and total_training_time >= next_batch_growth_time
+    ):
+        grow_batch_only(current_step=step)
 
     flops_so_far = training_flops_so_far
 
@@ -1367,7 +858,9 @@ while True:
                     "total_training_time": total_training_time,
                     "training_tokens_so_far": training_tokens_so_far,
                     "training_flops_so_far": training_flops_so_far,
-                    "growth_event_done": growth_event_done,
+                    "morph_event_done": morph_event_done,
+                    "batch_growth_events": batch_growth_events,
+                    "next_batch_growth_time": next_batch_growth_time,
                 },
             },
             rank=ddp_rank,
@@ -1380,12 +873,11 @@ while True:
                 f"Wall-clock limit reached: {total_training_time:.2f}s "
                 f">= {args.max_wall_clock_time:.2f}s. Stopping training."
             )
-            # Save the morphed wider model too.
-            raw_root = os.path.join(checkpoint_dir, "raw_params")
-            SaveModelAsRawParams(
-                model,
-                os.path.join(raw_root, f"step_{current_step:05d}_final"),
-            )
+        save_model_as_raw_params(
+            orig_model,
+            os.path.join(experiment_logger.raw_root, f"step_{step:05d}_final"),
+            enabled=master_process,
+        )
         break
 
     # -------------------------------------------------------------------------
@@ -1465,33 +957,31 @@ while True:
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | B: {total_batch_size:,} | accum: {grad_accum_steps} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
 
-    # Mirror every repeated training-status print into a machine-friendly CSV.
-    if master_process:
-        training_csv_writer.writerow([
-            step,
-            num_iterations,
-            f"{pct_done:.6f}",
-            f"{debiased_smooth_loss:.9f}",
-            f"{lrm:.9f}",
-            total_batch_size,
-            grad_accum_steps,
-            f"{dt * 1000:.6f}",
-            tok_per_sec,
-            f"{mfu:.6f}",
-            dataloader_state_dict["epoch"],
-            dataloader_state_dict["pq_idx"],
-            dataloader_state_dict["rg_idx"],
-            f"{total_training_time:.9f}",
-            f"{total_training_time * 1000:.6f}",
-            "" if eta_seconds is None else f"{eta_seconds:.9f}",
-            "" if eta_seconds is None else f"{eta_seconds / 60:.9f}",
-            training_tokens_so_far,
-            f"{flops_so_far:.9e}",
-            model_config.n_layer,
-            model_config.n_embd,
-            model_config.n_head,
-            num_params,
-        ])
+    experiment_logger.metric({
+        "step": step,
+        "num_iterations": num_iterations,
+        "pct_done": f"{pct_done:.6f}",
+        "training_loss": f"{train_loss_f:.9f}",
+        "smooth_training_loss": f"{debiased_smooth_loss:.9f}",
+        "lrm": f"{lrm:.9f}",
+        "total_batch_size": total_batch_size,
+        "device_batch_size": args.device_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "dt_ms": f"{dt * 1000:.6f}",
+        "tok_per_sec": tok_per_sec,
+        "bf16_mfu": f"{mfu:.6f}",
+        "epoch": dataloader_state_dict["epoch"],
+        "pq_idx": dataloader_state_dict["pq_idx"],
+        "rg_idx": dataloader_state_dict["rg_idx"],
+        "training_time_s": f"{total_training_time:.9f}",
+        "process_wall_time_s": f"{time.time() - process_start_time:.9f}",
+        "training_tokens_so_far": training_tokens_so_far,
+        "total_training_flops": f"{flops_so_far:.9e}",
+        "model_n_layer": model_config.n_layer,
+        "model_n_embd": model_config.n_embd,
+        "model_n_head": model_config.n_head,
+        "model_num_params": num_params,
+    })
 
     if step % 100 == 0:
         log_data = {
@@ -1531,7 +1021,22 @@ if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
 # cleanup
-if training_csv_file is not None:
-    training_csv_file.close()
+if master_process:
+    final_results = {
+        "experiment_name": experiment_name,
+        "final_step": step,
+        "total_training_time_s": total_training_time,
+        "process_wall_time_s": time.time() - process_start_time,
+        "training_tokens": training_tokens_so_far,
+        "final_model_config": model_config_kwargs,
+        "final_num_params": num_params,
+        "min_val_bpb": None if min_val_bpb == float("inf") else min_val_bpb,
+        "val_bpb": val_bpb,
+        "core_metric": results.get("core_metric") if results else None,
+        "core_results": results,
+    }
+    with open(os.path.join(experiment_dir, "final_results.json"), "w", encoding="utf-8") as f:
+        json.dump(final_results, f, indent=2, default=str)
 wandb_run.finish() # wandb run finish
+experiment_logger.close()
 compute_cleanup()
