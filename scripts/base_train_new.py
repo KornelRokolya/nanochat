@@ -1,14 +1,14 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train
+python -m scripts.base_train_new
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+torchrun --nproc_per_node=8 -m scripts.base_train_new
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.base_train_new --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -18,7 +18,6 @@ import json
 import time
 import math
 import argparse
-import csv
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -92,6 +91,24 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+
+# Fail early on contradictory experiment settings, before allocating a model.
+if args.morph_at_seconds >= 0:
+    if args.morph_target_depth <= 0:
+        parser.error("--morph-target-depth must be > 0 when --morph-at-seconds is enabled")
+    if args.morph_target_depth <= args.depth:
+        parser.error("--morph-target-depth must be larger than --depth")
+    if args.morph_strategy == "duplicate" and args.morph_target_depth != 2 * args.depth:
+        parser.error("duplicate morphing requires --morph-target-depth == 2 * --depth")
+if args.batch_growth_interval_seconds > 0 and args.batch_growth_factor <= 1:
+    parser.error("--batch-growth-factor must be > 1 when batch growth is enabled")
+if args.batch_growth_interval_seconds == 0:
+    parser.error("--batch-growth-interval-seconds must be negative (disabled) or > 0")
+if not 0.0 <= args.warmdown_ratio <= 1.0:
+    parser.error("--warmdown-ratio must be between 0 and 1")
+if not 0.0 <= args.final_lr_frac <= 1.0:
+    parser.error("--final-lr-frac must be between 0 and 1")
+
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -110,6 +127,10 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 print0(f"Morph at training time: {args.morph_at_seconds}s (negative disables)")
 print0(f"Batch growth interval: {args.batch_growth_interval_seconds}s (negative disables)")
+print0(
+    "Scheduler basis: "
+    + ("wall-clock training time" if args.max_wall_clock_time > 0 else "optimizer steps")
+)
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -167,6 +188,27 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+
+# Validate shape-level morph compatibility now, not minutes into a paid run.
+if args.morph_at_seconds >= 0:
+    target_preflight = build_model_meta(args.morph_target_depth)
+    target_cfg = target_preflight.config
+    if args.morph_strategy == "duplicate":
+        if target_cfg.n_embd != 2 * model_config.n_embd:
+            raise ValueError(
+                "duplicate morph requires exact width doubling after head-dim rounding: "
+                f"{model_config.n_embd} -> {target_cfg.n_embd}"
+            )
+        if target_cfg.n_head != 2 * model_config.n_head or target_cfg.n_kv_head != 2 * model_config.n_kv_head:
+            raise ValueError(
+                "duplicate morph requires exact Q/KV head doubling after config construction"
+            )
+    print0(
+        f"Morph target preflight: d{target_cfg.n_layer}, d_model={target_cfg.n_embd}, "
+        f"heads={target_cfg.n_head}, kv_heads={target_cfg.n_kv_head}"
+    )
+    del target_preflight
+
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
@@ -194,7 +236,28 @@ print0(f"Events CSV: {os.path.join(experiment_dir, 'events.csv')}")
 print0(f"Text log: {os.path.join(experiment_dir, 'log.txt')}")
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank
+    )
+
+    # A checkpoint written after a morph can have a different architecture than
+    # the CLI's initial --depth. Rebuild from the saved live model config before
+    # loading parameters so resumed d6->d12 runs do not shape-mismatch.
+    saved_model_config = meta_data.get("model_config")
+    if saved_model_config is not None:
+        saved_cfg = GPTConfig(**saved_model_config)
+        if asdict(saved_cfg) != model_config_kwargs:
+            print0(
+                "Checkpoint architecture differs from CLI initial architecture; "
+                f"rebuilding live model as d{saved_cfg.n_layer}."
+            )
+            with torch.device("meta"):
+                model = GPT(saved_cfg)
+            model.to_empty(device=device)
+            model.init_weights()  # initializes non-persistent rotary buffers too
+            model_config = saved_cfg
+            model_config_kwargs = asdict(saved_cfg)
+
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -445,37 +508,56 @@ if master_process:
         "resolved_num_iterations": num_iterations,
         "resolved_target_tokens": target_tokens,
         "resolved_weight_decay": weight_decay_scaled,
+        "schedule_basis": "wall_clock_training_time" if args.max_wall_clock_time > 0 else "optimizer_step",
     })
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# Schedule progress. Timed experiments use elapsed TRAINING time as the horizon,
+# because a huge safety value for --num-iterations must not accidentally disable
+# LR warmdown. Untimed Nanochat runs retain the original step-based schedule.
+def get_schedule_progress(it):
+    if args.max_wall_clock_time > 0:
+        return min(max(total_training_time / args.max_wall_clock_time, 0.0), 1.0)
+    return min(max(it / max(num_iterations, 1), 0.0), 1.0)
+
+
+def _warmdown_progress(it):
+    ratio = min(max(args.warmdown_ratio, 0.0), 1.0)
+    if ratio <= 0:
+        return 0.0
+    progress = get_schedule_progress(it)
+    start = 1.0 - ratio
+    if progress <= start:
+        return 0.0
+    return min(max((progress - start) / ratio, 0.0), 1.0)
+
+
+# Learning rate schedule: step-based warmup, then constant + linear warmdown.
+# For --max-wall-clock-time runs, warmdown position is based on wall-clock training
+# progress rather than num_iterations.
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
     if warmup_iters > 0 and it < warmup_iters:
         return (it + 1) / warmup_iters
     if args.disable_lr_decay:
         return 1.0
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if warmdown_iters <= 0 or it <= num_iterations - warmdown_iters:
-        return 1.0
-    progress = max(0.0, (num_iterations - it) / warmdown_iters)
-    return progress + (1 - progress) * args.final_lr_frac
+    wd_progress = _warmdown_progress(it)
+    return 1.0 - wd_progress * (1.0 - args.final_lr_frac)
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
+
+# Momentum scheduler for Muon optimizer (warms up to 0.97, then follows the same
+# warmdown horizon as LR and reaches 0.90 at the end).
 def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
     if it < 400:
         frac = it / 400
         return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
+    wd_progress = _warmdown_progress(it)
+    return 0.97 * (1 - wd_progress) + 0.90 * wd_progress
 
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
+
+# Weight decay scheduler for Muon optimizer (cosine decay over the active run horizon).
 def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
+    progress = get_schedule_progress(it)
+    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * progress))
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -486,6 +568,7 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    last_train_loss = None
     total_training_time = 0 # total wall-clock time of training
     training_tokens_so_far = 0 # actual tokens consumed; required once batch size can change
     training_flops_so_far = 0.0 # actual cumulative FLOPs; model FLOPs/token can change online
@@ -503,6 +586,7 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    last_train_loss = loop_state.get("last_train_loss")
     total_training_time = loop_state["total_training_time"]
     # New scheduled checkpoints contain these fields. Fall back gracefully for old checkpoints.
     training_tokens_so_far = loop_state.get("training_tokens_so_far", total_batch_size * step)
@@ -637,6 +721,17 @@ def morph_model_to_target(current_step):
         enabled=master_process,
     )
 
+    # The old optimizer is not migrated. Release it and the compiled wrapper
+    # before allocating the larger model. Keep only old_state.orig_model alive
+    # because its learned parameters are still needed for the morph copy.
+    old_state.optimizer = None
+    old_state.model = None
+    optimizer = None
+    model = None
+    gc.collect()
+    if device_type == "cuda":
+        torch.cuda.empty_cache()
+
     new_orig_model = target_meta
     new_orig_model.to_empty(device=device)
     new_orig_model.init_weights()
@@ -686,9 +781,10 @@ def morph_model_to_target(current_step):
         * (D_REF / new_target_tokens)
     )
 
-    # Optimizer restart is intentional for today's morph experiments.
-    old_state.optimizer = None
-    old_state.model = None
+    # Morph copy/diagnostics are complete, so the old learned model can now be
+    # released before allocating optimizer states for the larger model.
+    old_state.orig_model = None
+    orig_model = None
     gc.collect()
     if device_type == "cuda":
         torch.cuda.empty_cache()
@@ -707,7 +803,7 @@ def morph_model_to_target(current_step):
         if group["kind"] == "muon":
             group["momentum"] = get_muon_momentum(current_step)
             group["weight_decay"] = new_weight_decay_scaled * 0.5 * (
-                1 + math.cos(math.pi * current_step / num_iterations)
+                1 + math.cos(math.pi * get_schedule_progress(current_step))
             )
 
     new_model = torch.compile(new_orig_model, dynamic=False)
@@ -738,7 +834,6 @@ def morph_model_to_target(current_step):
     })
     experiment_logger.event(total_training_time, time.time() - process_start_time, current_step, "morph", details)
 
-    old_state.orig_model = None
     del old_state
     gc.collect()
     if device_type == "cuda":
@@ -855,6 +950,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "last_train_loss": last_train_loss,
                     "total_training_time": total_training_time,
                     "training_tokens_so_far": training_tokens_so_far,
                     "training_flops_so_far": training_flops_so_far,
@@ -898,6 +994,7 @@ while True:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
+    schedule_progress_used = get_schedule_progress(step)
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
@@ -920,6 +1017,7 @@ while True:
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = (train_loss_sum / grad_accum_steps).item() # one CPU-GPU sync point
+    last_train_loss = train_loss_f
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -944,6 +1042,12 @@ while True:
     if step > 0:
         total_training_time += dt
 
+    time_pct_done = (
+        100.0 * min(total_training_time / args.max_wall_clock_time, 1.0)
+        if args.max_wall_clock_time > 0
+        else None
+    )
+
     # Calculate ETA from counted training steps. This does not alter the LR schedule.
     steps_done = step
     if steps_done > 0:
@@ -961,6 +1065,8 @@ while True:
         "step": step,
         "num_iterations": num_iterations,
         "pct_done": f"{pct_done:.6f}",
+        "time_pct_done": "" if time_pct_done is None else f"{time_pct_done:.6f}",
+        "schedule_progress": f"{schedule_progress_used:.9f}",
         "training_loss": f"{train_loss_f:.9f}",
         "smooth_training_loss": f"{debiased_smooth_loss:.9f}",
         "lrm": f"{lrm:.9f}",
@@ -1014,11 +1120,32 @@ while True:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
 
-# print a few more stats
+# Final human-readable summary after all final evaluation has completed.
+final_core_metric = results.get("core_metric") if results else None
+print0("=" * 80)
+print0("FINAL RESULTS")
+print0(f"Experiment: {experiment_name}")
+print0(
+    f"Final model: d{model_config.n_layer} | d_model={model_config.n_embd} | "
+    f"heads={model_config.n_head} | params={num_params:,}"
+)
+print0(f"Final step: {step:,} | training tokens: {training_tokens_so_far:,}")
+print0(
+    f"Final batch: {total_batch_size:,} tokens | accum={grad_accum_steps} | "
+    f"batch growth events={batch_growth_events}"
+)
+print0(f"Morph performed: {morph_event_done}")
+print0(f"Training time: {total_training_time:.3f}s ({total_training_time/60:.2f}m)")
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
+if last_train_loss is not None:
+    print0(f"Last raw training loss: {last_train_loss:.6f}")
 if val_bpb is not None:
+    print0(f"Final validation bpb: {val_bpb:.6f}")
+if min_val_bpb != float("inf"):
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+if final_core_metric is not None:
+    print0(f"Final CORE metric: {final_core_metric:.6f}")
+print0("=" * 80)
 
 # cleanup
 if master_process:
@@ -1028,11 +1155,17 @@ if master_process:
         "total_training_time_s": total_training_time,
         "process_wall_time_s": time.time() - process_start_time,
         "training_tokens": training_tokens_so_far,
+        "last_training_loss": last_train_loss,
         "final_model_config": model_config_kwargs,
         "final_num_params": num_params,
+        "final_total_batch_size": total_batch_size,
+        "final_grad_accum_steps": grad_accum_steps,
+        "morph_performed": morph_event_done,
+        "batch_growth_events": batch_growth_events,
+        "schedule_basis": "wall_clock_training_time" if args.max_wall_clock_time > 0 else "optimizer_step",
         "min_val_bpb": None if min_val_bpb == float("inf") else min_val_bpb,
         "val_bpb": val_bpb,
-        "core_metric": results.get("core_metric") if results else None,
+        "core_metric": final_core_metric,
         "core_results": results,
     }
     with open(os.path.join(experiment_dir, "final_results.json"), "w", encoding="utf-8") as f:
