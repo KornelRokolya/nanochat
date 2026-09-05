@@ -7,96 +7,10 @@ set -euo pipefail
 
 # =============================================================================
 # EXPERIMENT CONFIGURATION
-# Edit this section for each run.
 # =============================================================================
-
-# Which trainer to run:
-#   "original" -> scripts/base_train.py       (Karpathy baseline)
-#   "new"      -> scripts/base_train_new.py   (new experimental trainer)
-TRAINER="new"
-
-# Give every experiment an explicit, stable name.
-# Examples:
-#   RTX3090_d4_baseline
-#   RTX3090_d4_newCodeTest
-#   RTX3090_d4_batchSizeIncreaseTest
-#   RTX3090_d4d8_morphingTest
-EXPERIMENT_NAME="RTX3090_d4_newCodeTest"
-
-# Basic training configuration shared by BOTH trainers.
-DEPTH=4
-DEVICE_BATCH_SIZE=16
-
-# -1 lets Nanochat calculate the model-size-dependent batch automatically.
-# For controlled smoke tests you can instead specify a token batch explicitly,
-# e.g. 32768 for d4,b16 with one accumulation step at sequence length 2048.
-TOTAL_BATCH_SIZE=-1
-
-# Keep this deliberately large when NEW trainer wall-clock stopping is enabled.
-# The original trainer has no wall-clock stop, so for original runs this value
-# is the actual training horizon and must be chosen appropriately.
-NUM_ITERATIONS=1000000
-
-MAX_SEQ_LEN=2048
-WINDOW_PATTERN="L"
-GPU_TYPE="RTX_3090"
-
-# "dummy" disables online Weights & Biases logging.
-RUN_NAME="dummy"
-
-
-# =============================================================================
-# NEW TRAINER ONLY
-# These values are ignored when TRAINER="original".
-# =============================================================================
-
-# Exact accumulated training-time budget in seconds.
-MAX_WALL_CLOCK_TIME=300
-
-# Disable Nanochat's LR warmdown/decay while retaining warmup.
-DISABLE_LR_DECAY=false
-
-# Model morphing.
-# Negative MORPH_AT_SECONDS disables morphing.
-MORPH_AT_SECONDS=-1
-MORPH_TARGET_DEPTH=-1
-MORPH_STRATEGY="duplicate"       # duplicate | new_capacity
-MORPH_NOISE_GAIN="1e-3"
-MORPH_SEED=12345
-
-# Independent batch-size growth.
-# Negative BATCH_GROWTH_INTERVAL_SECONDS disables it.
-BATCH_GROWTH_INTERVAL_SECONDS=-1
-BATCH_GROWTH_START_SECONDS=-1    # -1 => first growth after one interval
-BATCH_GROWTH_FACTOR=2
-
-
-# =============================================================================
-# EVALUATION
-# =============================================================================
-
-# Use a very large interval so evaluation does not interrupt short timed runs.
-# Both trainers still perform their normal final evaluation if their code is
-# configured to do so.
-EVAL_EVERY=1000000000
-CORE_METRIC_EVERY=1000000000
-SAMPLE_EVERY=-1
-SAVE_EVERY=-1
-
-
-# =============================================================================
-# DATA / REPOSITORY CONFIGURATION
-# =============================================================================
-
-TOKENIZER_SHARDS=8
-TRAINING_SHARDS=170
-
-REPO_URL="https://github.com/KornelRokolya/nanochat.git"
-BRANCH="batch-schedule"
-
-WORKSPACE="/workspace"
-REPO_DIR="${WORKSPACE}/nanochat"
-NANOCHAT_BASE_DIR="${WORKSPACE}/nanochat_cache"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/configs/H100_d6d12_morphing.env"
+source "${CONFIG_FILE}"
 
 
 # =============================================================================
@@ -239,6 +153,37 @@ if [ ! -f "${TRAINER_FILE}" ]; then
 fi
 
 echo "Selected trainer file: ${TRAINER_FILE}"
+
+# Fail before dataset download if the refactored trainer was not copied/committed
+# as a complete three-file set.
+if [ "${TRAINER}" = "new" ]; then
+  REQUIRED_NEW_FILES=(
+    "${REPO_DIR}/scripts/base_train_new.py"
+    "${REPO_DIR}/scripts/morphing.py"
+    "${REPO_DIR}/scripts/experiment_utils.py"
+  )
+  for REQUIRED_FILE in "${REQUIRED_NEW_FILES[@]}"; do
+    if [ ! -f "${REQUIRED_FILE}" ]; then
+      echo "ERROR: required new-trainer file is missing: ${REQUIRED_FILE}"
+      exit 1
+    fi
+  done
+
+  echo "=== Python syntax check: new trainer ==="
+  python -m py_compile \
+    scripts/base_train_new.py \
+    scripts/morphing.py \
+    scripts/experiment_utils.py
+else
+  echo "=== Python syntax check: original trainer ==="
+  python -m py_compile scripts/base_train.py
+fi
+
+# Import/argparse preflight. --help exits before model/data initialization but
+# still catches broken Python imports between the selected trainer modules.
+echo "=== Trainer import / CLI preflight ==="
+python -m "${TRAIN_MODULE}" --help >/dev/null
+echo "Trainer preflight OK."
 
 
 # =============================================================================
